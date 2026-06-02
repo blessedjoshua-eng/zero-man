@@ -1,7 +1,0 @@
-flask
-pandas
-requests
-pycryptodome
-openpyxl
-waitress
-gunicorn
