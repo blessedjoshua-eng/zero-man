@@ -1,17 +1,20 @@
 """
-IndiaFirst Life — COI PDF Bulk Downloader
-Backend logic — imported and called by app.py (Flask).
+Zero Man — COI PDF Bulk Downloader
+Backend logic, imported and called by app.py
 
 Changes from original script
 ─────────────────────────────
   • No hardcoded paths or globals
-  • process_customers() now accepts all config as parameters
-  • All print() calls replaced with log_cb(dict) for live SSE streaming
-  • send_email_with_pdf() takes smtp_cfg dict instead of module-level vars
-  • API / encryption code is identical to the original
+  • process_customers() accepts all config as parameters
+  • column_mapping  : renames Excel columns to required field names
+  • All print() replaced with log_cb(dict) for live SSE streaming
+  • send_email_with_pdf() takes smtp_cfg dict
+  • PDF saved as  {number_value}_COI.pdf
+  • API / encryption logic is identical to the original
 """
 
 import os
+import io
 import time
 import json
 import base64
@@ -24,13 +27,13 @@ from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
 
-import io
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
+
 # ─────────────────────────────────────────────
-#  API Constants  (unchanged)
+#  API Constants
 # ─────────────────────────────────────────────
 BASE_URL         = "https://www.indiafirstlife.com"
 TOKEN_URL        = f"{BASE_URL}/content/ifliwebsite/in/osgi_token.json"
@@ -39,8 +42,9 @@ TOKEN_BODY_STEP2 = "siteidentifier=WebsiteToken"
 STEP1_URL        = "https://apig.indiafirstlife.com/getgroupcoidetails/"
 STEP2_URL        = "https://apig.indiafirstlife.com/website_data/getFciWebhookDetails"
 
+
 # ─────────────────────────────────────────────
-#  Encryption Constants  (unchanged)
+#  Encryption Constants
 # ─────────────────────────────────────────────
 SIMPLE_KEY     = b"tokentokentokentokentokentokenwe"
 SIMPLE_IV      = b"encryptionIntVec"
@@ -48,6 +52,10 @@ CODE_KEY       = "d6163f0659cfe4196dc03c2c29aab06f10cb0a79cdfc74a45da2d72358712e
 PBKDF2_KEY_LEN = 32
 PBKDF2_ITERS   = 100
 
+
+# ─────────────────────────────────────────────
+#  Product → Trigger Name Map
+# ─────────────────────────────────────────────
 TRIGGER_MAP = {
     "GLP"      : "IFL_OnDemand_GLP",
     "HEALTH"   : "IFL_OnDemand_Hospicare",
@@ -57,6 +65,10 @@ TRIGGER_MAP = {
     "GCL PLUS" : "IFL_OnDemand_GCLPlus",
 }
 
+
+# ─────────────────────────────────────────────
+#  Request Headers
+# ─────────────────────────────────────────────
 HEADERS_BASE = {
     "User-Agent" : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept"     : "application/json, text/plain, */*",
@@ -66,7 +78,7 @@ HEADERS_BASE = {
 
 
 # ─────────────────────────────────────────────
-#  Encryption Helpers  (unchanged)
+#  Encryption Helpers
 # ─────────────────────────────────────────────
 def simple_aes_encrypt(plaintext: str) -> str:
     cipher = AES.new(SIMPLE_KEY, AES.MODE_CBC, SIMPLE_IV)
@@ -103,7 +115,7 @@ def pbkdf2_aes_decrypt(passphrase: str, ciphertext: str) -> str:
 
 
 # ─────────────────────────────────────────────
-#  Token Helper  (unchanged)
+#  Token Helper
 # ─────────────────────────────────────────────
 def get_bearer_token(session: requests.Session, token_body: str) -> str:
     resp = session.post(
@@ -117,7 +129,7 @@ def get_bearer_token(session: requests.Session, token_body: str) -> str:
 
 
 # ─────────────────────────────────────────────
-#  Step 1 — Get Policy Details  (unchanged)
+#  Step 1 — Fetch Policy Details
 # ─────────────────────────────────────────────
 def get_policy_details(session, token, product_type, number_type, number_value, master_policy=""):
     payload = {
@@ -136,7 +148,7 @@ def get_policy_details(session, token, product_type, number_type, number_value, 
     resp.raise_for_status()
     resp_json = resp.json()
     if "data" not in resp_json:
-        raise ValueError(f"Unexpected Step1 response: {resp_json}")
+        raise ValueError(f"Unexpected Step 1 response: {resp_json}")
     decrypted = json.loads(simple_aes_decrypt(resp_json["data"]))
     if isinstance(decrypted, dict) and "getGroupCoiResponse" in decrypted:
         records = decrypted["getGroupCoiResponse"].get("data", [])
@@ -147,10 +159,11 @@ def get_policy_details(session, token, product_type, number_type, number_value, 
 
 
 # ─────────────────────────────────────────────
-#  Step 2 — Download COI PDF  (unchanged)
+#  Step 2 — Download COI PDF
 # ─────────────────────────────────────────────
 def download_coi_pdf(session, token, trigger_name, rec, dob, financial_year, number_type, number_value):
     dob_normalised = dob.replace("-", "/")
+
     webhook_payload = {
         "triggerName"        : trigger_name,
         "to"                 : [], "cc": [], "bcc": [],
@@ -195,6 +208,7 @@ def download_coi_pdf(session, token, trigger_name, rec, dob, financial_year, num
             "Product_Type"           : trigger_name.split("_")[-1] if "_" in trigger_name else "",
         },
     }
+
     encrypted = pbkdf2_aes_encrypt(CODE_KEY, json.dumps(webhook_payload))
     resp = session.post(
         STEP2_URL,
@@ -204,17 +218,21 @@ def download_coi_pdf(session, token, trigger_name, rec, dob, financial_year, num
     )
     resp.raise_for_status()
     resp_json = resp.json()
+
     if resp_json.get("header", {}).get("statusCode") != "200":
         raise ValueError(f"API error: {resp_json.get('header', {}).get('responseMessage')}")
+
     decrypted = pbkdf2_aes_decrypt(CODE_KEY, resp_json["response"])
     resp_data = json.loads(decrypted)
+
     if resp_data.get("status") != "200":
         raise ValueError(f"PDF fetch failed: {resp_data}")
+
     return base64.b64decode(resp_data["fileContent"])
 
 
 # ─────────────────────────────────────────────
-#  Email Helper  — smtp_cfg dict replaces globals
+#  Email Helper
 # ─────────────────────────────────────────────
 def send_email_with_pdf(smtp_cfg: dict, to_email: str, customer_name: str,
                         pdf_bytes: bytes, pdf_filename: str):
@@ -242,111 +260,7 @@ def send_email_with_pdf(smtp_cfg: dict, to_email: str, customer_name: str,
 
 
 # ─────────────────────────────────────────────
-#  Main Processor  — now callable by Flask
+#  Main Processor
 # ─────────────────────────────────────────────
 def process_customers(excel_bytes: bytes, output_dir: str,
-                      smtp_cfg: dict, send_email: bool,
-                      log_cb):
-    """
-    Process all rows in the Excel file and download COI PDFs.
-
-    Parameters
-    ----------
-    excel_bytes : bytes    Excel file as raw bytes (uploaded via browser).
-    output_dir : str       Folder where downloaded PDFs are saved.
-    smtp_cfg   : dict      Keys: host, port, user, password
-    send_email : bool      Whether to email PDFs to customers.
-    log_cb     : callable  Receives a dict event — streamed live to the browser.
-                           Event keys: type, message, [total, current, success, failed]
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    df = pd.read_excel(io.BytesIO(excel_bytes))
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-
-    mandatory = {"product_name", "financial_year", "dob", "number_type", "number_value"}
-    missing   = mandatory - set(df.columns)
-    if missing:
-        log_cb({"type": "error",   "message": f"Missing mandatory columns: {missing}"})
-        log_cb({"type": "done",    "message": "Job aborted — fix the Excel file and retry.",
-                "success": 0, "failed": 0, "total": 0})
-        return
-
-    for col in ["customer_name", "email", "master_policy"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    total = len(df)
-    success = failed = 0
-
-    log_cb({"type": "info", "message": f"Loaded {total} records from Excel.", "total": total})
-
-    for idx, row in df.iterrows():
-        customer_name  = str(row["customer_name"]).strip()  if pd.notna(row["customer_name"]) else ""
-        email          = str(row["email"]).strip()          if pd.notna(row["email"])          else ""
-        product_name   = str(row["product_name"]).strip().upper()
-        financial_year = str(row["financial_year"]).strip()
-        dob            = str(row["dob"]).strip()
-        number_type    = str(row["number_type"]).strip().lower()
-        number_value   = str(row["number_value"]).strip()
-        master_policy  = str(row["master_policy"]).strip() if pd.notna(row["master_policy"]) else ""
-
-        log_cb({"type": "processing",
-                "message": f"Processing: {number_value}",
-                "current": idx + 1, "total": total})
-
-        trigger_name = TRIGGER_MAP.get(product_name)
-        if not trigger_name:
-            log_cb({"type": "skip",
-                    "message": f"[{number_value}] Unknown product '{product_name}'. "
-                               f"Valid: {list(TRIGGER_MAP)}"})
-            failed += 1
-            continue
-
-        pdf_filename  = f"{number_value}_COI.pdf"
-        pdf_save_path = output_path / pdf_filename
-
-        try:
-            session = requests.Session()
-
-            log_cb({"type": "step", "message": f"[{number_value}] → Step 1: fetching token..."})
-            token1 = get_bearer_token(session, TOKEN_BODY_STEP1)
-
-            log_cb({"type": "step", "message": f"[{number_value}] → Fetching policy details..."})
-            rec = get_policy_details(session, token1, product_name,
-                                     number_type, number_value, master_policy)
-
-            log_cb({"type": "step", "message": f"[{number_value}] → Step 2: fetching token..."})
-            token2 = get_bearer_token(session, TOKEN_BODY_STEP2)
-
-            log_cb({"type": "step", "message": f"[{number_value}] → Downloading COI PDF..."})
-            pdf_bytes = download_coi_pdf(session, token2, trigger_name, rec,
-                                         dob, financial_year, number_type, number_value)
-
-            with open(pdf_save_path, "wb") as f:
-                f.write(pdf_bytes)
-
-            log_cb({"type": "success",
-                    "message": f"[{number_value}] Saved — {len(pdf_bytes):,} bytes → {pdf_save_path}"})
-
-            if send_email and email and email.lower() not in ("nan", "none", ""):
-                log_cb({"type": "step", "message": f"[{number_value}] → Emailing to {email}..."})
-                send_email_with_pdf(smtp_cfg, email, customer_name, pdf_bytes, pdf_filename)
-                log_cb({"type": "email", "message": f"[{number_value}] Email sent to {email}"})
-
-            success += 1
-
-        except Exception as exc:
-            log_cb({"type": "error", "message": f"[{number_value}] ERROR: {exc}"})
-            failed += 1
-
-        time.sleep(2)   # polite delay between API calls
-
-    log_cb({
-        "type"   : "done",
-        "message": f"Completed — ✅ {success} success | ❌ {failed} failed | Total: {total}",
-        "success": success,
-        "failed" : failed,
-        "total"  : total,
-    })
+                      smtp_cfg: dict, send_email:
