@@ -1,506 +1,397 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Zero Man — COI Toolkit</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+"""
+Zero Man — COI PDF Bulk Downloader
+Backend logic, imported and called by app.py
 
-    :root {
-      --sb-w: 230px;
-      --acc:    #d1d5db;
-      --acc-dk: #9ca3af;
-      --acc-lt: rgba(255,255,255,.06);
-      --green: #22c55e; --red: #ef4444; --amber: #f59e0b;
-      --bg:  #1e2027;
-      --bg2: #272a34;
-      --bg3: #2f3241;
-      --bg4: #383b4a;
-      --border:  rgba(255,255,255,.07);
-      --border2: rgba(255,255,255,.13);
-      --text:  #e8ecf0;
-      --text2: #8892a4;
-      --text3: #4f5a6b;
-      --sb: #0b0e17;
-      --sb-txt: #6b7a94;
-      --radius: 10px;
-      --shadow: 0 1px 3px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.25);
-    }
+Changes from original script
+─────────────────────────────
+  • No hardcoded paths or globals
+  • process_customers() accepts all config as parameters
+  • column_mapping  : renames Excel columns to required field names
+  • All print() replaced with log_cb(dict) for live SSE streaming
+  • send_email_with_pdf() takes smtp_cfg dict
+  • PDF saved as  {number_value}_COI.pdf
+  • API / encryption logic is identical to the original
+"""
 
-    body {
-      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-      background: var(--bg); color: var(--text);
-      display: flex; height: 100vh; overflow: hidden; font-size: 14px;
-    }
+import os
+import io
+import time
+import json
+import base64
+import hashlib
+import smtplib
+import pandas as pd
+from pathlib import Path
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
 
-    /* ── SIDEBAR ── */
-    .sb { width: var(--sb-w); background: var(--sb); display: flex; flex-direction: column; flex-shrink: 0; border-right: 1px solid var(--border); }
-    .sb-logo { padding: 20px 18px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 11px; }
-    .sb-logo-img { width: 38px; height: 38px; border-radius: 9px; object-fit: cover; flex-shrink: 0; border: 1px solid var(--border2); }
-    .sb-name { font-size: 14px; font-weight: 700; color: #fff; }
-    .sb-sec { font-size: 10px; font-weight: 600; color: var(--text3); letter-spacing: .9px; text-transform: uppercase; padding: 20px 18px 8px; }
-    .ni { display: flex; align-items: center; gap: 10px; padding: 9px 14px; margin: 2px 8px; border-radius: 7px; cursor: pointer; transition: background .15s; user-select: none; }
-    .ni:hover { background: rgba(255,255,255,.05); }
-    .ni.active { background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.14); }
-    .ni.active .ni-lbl { color: #fff; font-weight: 600; }
-    .ni-ico { font-size: 15px; width: 22px; text-align: center; }
-    .ni-lbl { font-size: 13px; color: var(--sb-txt); font-weight: 500; flex: 1; }
+import requests
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
 
-    /* ── MAIN ── */
-    .main { flex: 1; overflow-y: auto; padding: 28px 32px; }
-    .main::-webkit-scrollbar { width: 6px; }
-    .main::-webkit-scrollbar-thumb { background: var(--bg4); border-radius: 3px; }
-    .page { display: none; }
-    .page.active { display: block; }
 
-    /* ── PAGE HEADER ── */
-    .ph { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 24px; }
-    .ph-h { font-size: 20px; font-weight: 700; color: #fff; }
-    .ph-s { font-size: 12px; color: var(--text2); margin-top: 3px; }
-    .spill { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 500; padding: 5px 14px; border-radius: 20px; background: var(--bg3); color: var(--text2); border: 1px solid var(--border2); transition: all .2s; white-space: nowrap; }
-    .spill.running { background: rgba(245,158,11,.1); color: var(--amber); border-color: rgba(245,158,11,.25); }
-    .sdot { width: 7px; height: 7px; border-radius: 50%; background: var(--text3); }
-    .sdot.pulse { background: var(--amber); animation: pulse 1s infinite; }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.2} }
+# ─────────────────────────────────────────────
+#  API Constants
+# ─────────────────────────────────────────────
+BASE_URL         = "https://www.indiafirstlife.com"
+TOKEN_URL        = f"{BASE_URL}/content/ifliwebsite/in/osgi_token.json"
+TOKEN_BODY_STEP1 = "siteidentifier=api_coi_tokenization"
+TOKEN_BODY_STEP2 = "siteidentifier=WebsiteToken"
+STEP1_URL        = "https://apig.indiafirstlife.com/getgroupcoidetails/"
+STEP2_URL        = "https://apig.indiafirstlife.com/website_data/getFciWebhookDetails"
 
-    /* ── CARDS ── */
-    .card { background: var(--bg2); border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 20px; border: 1px solid var(--border); }
-    .ch { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--bg3); border-radius: var(--radius) var(--radius) 0 0; }
-    .ch-ico { width: 34px; height: 34px; border-radius: 8px; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.1); display: flex; align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0; }
-    .ch-h { font-size: 14px; font-weight: 600; color: #fff; }
-    .ch-s { font-size: 12px; color: var(--text2); margin-top: 1px; }
-    .cb { padding: 20px; }
 
-    /* ── FIELD TABLE ── */
-    .ftbl { width: 100%; border-collapse: collapse; font-size: 13px; }
-    .ftbl th { text-align: left; padding: 9px 16px; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .6px; color: var(--text2); background: var(--bg4); border-bottom: 1px solid var(--border2); }
-    .ftbl th.map-th { color: var(--acc); background: rgba(255,255,255,.04); border-bottom-color: rgba(255,255,255,.12); }
-    .ftbl td { padding: 10px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; color: var(--text); }
-    .ftbl tr:last-child td { border-bottom: none; }
-    .ftbl tbody tr:hover td { background: rgba(255,255,255,.03); }
-    .fcol { font-family: 'Consolas','Courier New',monospace; font-size: 12px; font-weight: 600; color: var(--acc); background: rgba(255,255,255,.07); padding: 2px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,.12); }
-    .badge { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
-    .badge.m { background: rgba(239,68,68,.15); color: #f87171; border: 1px solid rgba(239,68,68,.25); }
-    .badge.o { background: rgba(34,197,94,.12); color: #4ade80; border: 1px solid rgba(34,197,94,.2); }
-    .vtag { display: inline-block; font-family: 'Consolas','Courier New',monospace; font-size: 11px; background: var(--bg4); color: var(--text2); padding: 1px 7px; border-radius: 4px; margin: 2px 2px 2px 0; border: 1px solid var(--border2); }
-    .fdesc { font-size: 12px; color: var(--text2); }
+# ─────────────────────────────────────────────
+#  Encryption Constants
+# ─────────────────────────────────────────────
+SIMPLE_KEY     = b"tokentokentokentokentokentokenwe"
+SIMPLE_IV      = b"encryptionIntVec"
+CODE_KEY       = "d6163f0659cfe4196dc03c2c29aab06f10cb0a79cdfc74a45da2d72358712e80"
+PBKDF2_KEY_LEN = 32
+PBKDF2_ITERS   = 100
 
-    /* ── MAPPING INPUT ── */
-    .map-input { width: 100%; min-width: 130px; padding: 6px 10px; border: 1px solid var(--border2); border-radius: 5px; font-size: 12px; color: var(--text); background: var(--bg); outline: none; font-family: 'Consolas','Courier New',monospace; transition: border-color .15s, box-shadow .15s; }
-    .map-input:focus { border-color: rgba(255,255,255,.35); box-shadow: 0 0 0 2px rgba(255,255,255,.06); }
-    .map-input.err { border-color: #ef4444 !important; box-shadow: 0 0 0 2px rgba(239,68,68,.12); }
-    .map-input::placeholder { color: #7c8799; font-size: 11px; }
 
-    /* ── FORM ── */
-    .g2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    .fg { display: flex; flex-direction: column; gap: 6px; }
-    label { font-size: 12px; font-weight: 600; color: var(--text2); }
-    .req { color: #f87171; margin-left: 2px; }
-    input[type=text],input[type=email],input[type=number],input[type=password] {
-      width: 100%; padding: 9px 12px; border: 1px solid var(--border2); border-radius: 7px;
-      font-size: 13px; color: var(--text); background: var(--bg4); outline: none;
-      transition: border-color .15s; font-family: inherit;
-    }
-    input:focus { border-color: rgba(255,255,255,.35); box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
-
-    /* ── UPLOAD ZONE ── */
-    .upload-zone { border: 2px dashed var(--border2); border-radius: var(--radius); padding: 36px 20px; text-align: center; cursor: pointer; background: var(--bg3); transition: all .2s; }
-    .upload-zone:hover, .upload-zone.drag { border-color: rgba(255,255,255,.3); background: rgba(255,255,255,.04); }
-    .uz-icon { font-size: 32px; margin-bottom: 10px; display: block; }
-    .uz-title { font-size: 14px; font-weight: 600; color: var(--text); }
-    .uz-sub { font-size: 13px; color: var(--text2); margin-top: 4px; }
-    .uz-link { color: var(--acc); text-decoration: underline; cursor: pointer; }
-    .uz-hint { font-size: 11px; color: var(--text3); margin-top: 10px; }
-
-    /* ── FILE CHIP ── */
-    .file-chip { display: none; align-items: center; gap: 10px; padding: 12px 16px; background: var(--bg3); border: 1px solid rgba(255,255,255,.18); border-radius: 8px; }
-    .fc-ico { font-size: 20px; flex-shrink: 0; }
-    .fc-name { font-size: 13px; font-weight: 600; color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .fc-size { font-size: 12px; color: var(--text2); flex-shrink: 0; }
-    .fc-rm { background: none; border: none; cursor: pointer; color: var(--text3); font-size: 14px; padding: 4px 6px; border-radius: 4px; transition: all .15s; }
-    .fc-rm:hover { color: var(--red); background: rgba(239,68,68,.1); }
-
-    /* ── TOGGLE ── */
-    .trow { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; }
-    .tlbl { font-size: 13px; font-weight: 600; color: var(--text); }
-    .tdesc { font-size: 13px; color: var(--text); font-weight: 600; margin-top: 3px; }
-    .tgl { position: relative; width: 44px; height: 24px; cursor: pointer; }
-    .tgl input { opacity: 0; width: 0; height: 0; }
-    .ts { position: absolute; inset: 0; background: #4a4f62; border-radius: 24px; cursor: pointer; transition: .2s; border: 1px solid rgba(255,255,255,.25); }
-    .ts::before { content: ''; position: absolute; height: 18px; width: 18px; left: 2px; bottom: 2px; background: var(--text2); border-radius: 50%; transition: .2s; }
-    .tgl input:checked + .ts { background: var(--acc); border-color: var(--acc-dk); }
-    .tgl input:checked + .ts::before { transform: translateX(20px); background: var(--sb); }
-    .smtp-wrap { display: none; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
-    .smtp-wrap.open { display: block; }
-
-    /* ── BUTTONS ── */
-    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 9px 16px; border-radius: 7px; font-size: 13px; font-weight: 500; font-family: inherit; cursor: pointer; border: none; transition: all .15s; white-space: nowrap; }
-    .btn-p { background: var(--acc); color: #111318; font-weight: 600; }
-    .btn-p:hover { background: #e8ecf0; }
-    .btn-p:disabled { background: var(--bg4); color: var(--text3); cursor: not-allowed; }
-    .btn-o { background: var(--bg4); color: var(--text); border: 1px solid var(--border2); }
-    .btn-o:hover { background: var(--bg3); border-color: rgba(255,255,255,.2); }
-    .btn-g { background: rgba(34,197,94,.15); color: #4ade80; border: 1px solid rgba(34,197,94,.25); }
-    .btn-g:hover { background: rgba(34,197,94,.22); }
-    .btn-lg { padding: 11px 28px; font-size: 14px; font-weight: 600; }
-
-    /* ── MISC ── */
-    .alert { display: flex; align-items: flex-start; gap: 10px; padding: 11px 15px; border-radius: 8px; font-size: 12.5px; margin-bottom: 16px; line-height: 1.5; }
-    .alert-info { background: rgba(255,255,255,.04); color: var(--acc); border-left: 3px solid rgba(255,255,255,.2); }
-    .div { height: 1px; background: var(--border); margin: 18px 0; }
-    .run-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 4px; }
-    .run-hint { font-size: 12px; color: var(--text2); }
-
-    /* ── PROGRESS ── */
-    .prog { display: none; }
-    .prog.open { display: block; }
-    .sg { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 16px; }
-    .sb-box { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; text-align: center; }
-    .sv { font-size: 26px; font-weight: 700; color: #fff; line-height: 1; }
-    .sv.b { color: var(--acc); }
-    .sv.g { color: #4ade80; }
-    .sv.r { color: #f87171; }
-    .sl { font-size: 11px; color: var(--text2); margin-top: 4px; font-weight: 500; }
-    .pbw { height: 8px; background: var(--bg4); border-radius: 4px; overflow: hidden; margin-bottom: 20px; }
-    .pbf { height: 100%; background: rgba(255,255,255,.35); border-radius: 4px; transition: width .4s; width: 0; }
-    .log { background: #080d17; border-radius: 8px; padding: 14px; height: 260px; overflow-y: auto; font-family: 'Consolas','Courier New',monospace; font-size: 12px; line-height: 1.75; border: 1px solid var(--border); }
-    .log::-webkit-scrollbar { width: 5px; }
-    .log::-webkit-scrollbar-thumb { background: var(--bg4); border-radius: 3px; }
-    .ll { display: flex; gap: 8px; }
-    .lt { color: #2d3d55; flex-shrink: 0; }
-    .ll.success .lm{color:#4ade80;} .ll.error .lm{color:#f87171;} .ll.step .lm{color:#475569;}
-    .ll.info .lm{color:var(--acc);} .ll.skip .lm{color:#fbbf24;} .ll.email .lm{color:#c4c9d4;}
-    .ll.processing .lm{color:#e2e8f0;font-weight:700;} .ll.done .lm{color:#34d399;font-weight:700;}
-    .log-ph { color: #1e2d42; text-align: center; padding: 60px 0; font-size: 13px; }
-
-    /* ── DOWNLOAD ── */
-    .dl-card { display: none; background: rgba(34,197,94,.06); border: 1px solid rgba(34,197,94,.2); border-radius: var(--radius); margin-top: 28px; margin-bottom: 28px; }
-    .dl-card.open { display: block; }
-    .dl-inner { display: flex; align-items: center; gap: 20px; padding: 20px; }
-    .dl-icon { font-size: 38px; flex-shrink: 0; }
-    .dl-title { font-size: 15px; font-weight: 700; color: #4ade80; }
-    .dl-sub { font-size: 12px; color: #86efac; margin-top: 3px; }
-    .dl-note { font-size: 11px; color: var(--text3); margin-top: 2px; }
-    .dl-actions { margin-left: auto; flex-shrink: 0; }
-
-    /* ── TOAST ── */
-    #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(80px); background: var(--bg3); color: var(--text); border: 1px solid var(--border2); font-size: 13px; padding: 10px 20px; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.5); transition: transform .3s; z-index: 9999; white-space: nowrap; }
-    #toast.show { transform: translateX(-50%) translateY(0); }
-    #toast.warn  { background: rgba(245,158,11,.15); color: #fde68a; border-color: rgba(245,158,11,.3); }
-    #toast.error { background: rgba(239,68,68,.15); color: #fca5a5; border-color: rgba(239,68,68,.3); }
-    #toast.ok    { background: rgba(34,197,94,.12); color: #4ade80; border-color: rgba(34,197,94,.25); }
-  </style>
-</head>
-<body>
-
-<!-- ══════ SIDEBAR ══════ -->
-<aside class="sb">
-  <div class="sb-logo">
-    <img src="https://i.pinimg.com/736x/bf/97/07/bf970748fa44e2324a39b6d5a5eeafa0--zero-typography.jpg"
-         alt="Zero Man" class="sb-logo-img" onerror="this.style.display='none'"/>
-    <div class="sb-name">Zero Man</div>
-  </div>
-  <div class="sb-sec">Tools</div>
-  <div class="ni active" onclick="navTo('coi',this)">
-    <span class="ni-ico">📄</span>
-    <span class="ni-lbl">COI Downloader</span>
-  </div>
-</aside>
-
-<!-- ══════ MAIN ══════ -->
-<main class="main">
-  <div class="page active" id="page-coi">
-
-    <div class="ph">
-      <div>
-        <div class="ph-h">COI PDF Downloader</div>
-        <div class="ph-s">Upload your Excel, download all COI PDFs as a ZIP</div>
-      </div>
-      <div class="spill" id="spill">
-        <span class="sdot" id="sdot"></span>
-        <span id="stxt">Idle</span>
-      </div>
-    </div>
-
-    <!-- FIELD REFERENCE + MAPPING -->
-    <div class="card">
-      <div class="ch">
-        <div class="ch-ico">📋</div>
-        <div>
-          <div class="ch-h">Excel File Format Reference</div>
-          <div class="ch-s">Map each required field to your Excel's actual column header name</div>
-        </div>
-      </div>
-      <div style="overflow-x:auto">
-        <table class="ftbl">
-          <thead>
-            <tr>
-              <th>Required Field</th>
-              <th>Required</th>
-              <th>Accepted Values / Format</th>
-              <th>Notes</th>
-              <th class="map-th" title="Type the exact column name as it appears in your Excel file">Your Excel Header ✱</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td><span class="fcol">product_name</span></td>
-              <td><span class="badge m">Mandatory</span></td>
-              <td><span class="vtag">GLP</span><span class="vtag">HEALTH</span><span class="vtag">MICRO</span><span class="vtag">GTL</span><span class="vtag">GCL</span><span class="vtag">GCL PLUS</span></td>
-              <td class="fdesc">Must match exactly (uppercase)</td>
-              <td><input class="map-input" data-field="product_name" data-req="1" type="text" placeholder="e.g. Product Name"/></td>
-            </tr>
-            <tr>
-              <td><span class="fcol">financial_year</span></td>
-              <td><span class="badge m">Mandatory</span></td>
-              <td><span class="vtag">2025-2026</span></td>
-              <td class="fdesc">Format: YYYY-YYYY</td>
-              <td><input class="map-input" data-field="financial_year" data-req="1" type="text" placeholder="e.g. Financial Year"/></td>
-            </tr>
-            <tr>
-              <td><span class="fcol">dob</span></td>
-              <td><span class="badge m">Mandatory</span></td>
-              <td><span class="vtag">DD/MM/YYYY</span>&nbsp;<span class="vtag">DD-MM-YYYY</span></td>
-              <td class="fdesc">Member's date of birth</td>
-              <td><input class="map-input" data-field="dob" data-req="1" type="text" placeholder="e.g. Date of Birth"/></td>
-            </tr>
-            <tr>
-              <td><span class="fcol">number_type</span></td>
-              <td><span class="badge m">Mandatory</span></td>
-              <td><span class="vtag">application number</span><span class="vtag">policy number</span><span class="vtag">loan number</span></td>
-              <td class="fdesc">Type of ID to look up the policy</td>
-              <td><input class="map-input" data-field="number_type" data-req="1" type="text" placeholder="e.g. Number Type"/></td>
-            </tr>
-            <tr>
-              <td><span class="fcol">number_value</span></td>
-              <td><span class="badge m">Mandatory</span></td>
-              <td><span class="vtag">APP123456</span></td>
-              <td class="fdesc">The actual number value</td>
-              <td><input class="map-input" data-field="number_value" data-req="1" type="text" placeholder="e.g. Policy Number"/></td>
-            </tr>
-            <tr>
-              <td><span class="fcol">customer_name</span></td>
-              <td><span class="badge o">Optional</span></td>
-              <td>Any text</td>
-              <td class="fdesc">Used in email greeting</td>
-              <td><input class="map-input" data-field="customer_name" type="text" placeholder="e.g. Customer Name"/></td>
-            </tr>
-            <tr>
-              <td><span class="fcol">email</span></td>
-              <td><span class="badge o">Optional</span></td>
-              <td>Valid email address</td>
-              <td class="fdesc">COI emailed here if Send Email is ON</td>
-              <td><input class="map-input" data-field="email" type="text" placeholder="e.g. Email ID"/></td>
-            </tr>
-            <tr>
-              <td><span class="fcol">master_policy</span></td>
-              <td><span class="badge o">Optional</span></td>
-              <td>Master policy number</td>
-              <td class="fdesc">Only for group policies</td>
-              <td><input class="map-input" data-field="master_policy" type="text" placeholder="e.g. Master Policy No"/></td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- CONFIGURATION -->
-    <div class="card">
-      <div class="ch">
-        <div class="ch-ico">⚙️</div>
-        <div>
-          <div class="ch-h">Configuration</div>
-          <div class="ch-s">Upload your Excel file and configure email (optional)</div>
-        </div>
-      </div>
-      <div class="cb">
-        <label style="display:block;margin-bottom:8px">Excel Input File <span class="req">*</span></label>
-
-        <div class="upload-zone" id="upload-zone">
-          <input type="file" id="excel-input" accept=".xlsx,.xls" style="display:none" onchange="fileChosen(this)"/>
-          <span class="uz-icon">📂</span>
-          <div class="uz-title">Drop your Excel file here</div>
-          <div class="uz-sub">or <span class="uz-link" onclick="event.stopPropagation();document.getElementById('excel-input').click()">click to browse</span></div>
-          <div class="uz-hint">.xlsx · .xls files only</div>
-        </div>
-
-        <div class="file-chip" id="file-chip">
-          <span class="fc-ico">📄</span>
-          <span class="fc-name" id="fc-name">file.xlsx</span>
-          <span class="fc-size" id="fc-size">0 KB</span>
-          <button class="fc-rm" onclick="clearFile()" title="Remove">✕</button>
-        </div>
-
-        <div class="fg" style="margin-top:16px">
-          <label>📁 Batch / Folder Name</label>
-          <input type="text" id="batch-name" placeholder="e.g. March_2025 — becomes the ZIP filename on download"/>
-        </div>
-
-        <div class="div"></div>
-            <div class="tdesc">Automatically email each COI PDF to the customer's address column</div>
-          </div>
-          <label class="tgl">
-            <input type="checkbox" id="email-tog" onchange="toggleSmtp(this)"/>
-            <span class="ts"></span>
-          </label>
-        </div>
-
-        <div class="smtp-wrap" id="smtp-wrap">
-          <div class="alert alert-info">
-            ℹ️&nbsp;&nbsp;For Gmail, generate an <strong>App Password</strong> under Google Account → Security → App Passwords.
-          </div>
-          <div class="g2">
-            <div class="fg"><label>SMTP Host</label><input type="text" id="smtp-host" value="smtp.gmail.com"/></div>
-            <div class="fg"><label>SMTP Port</label><input type="number" id="smtp-port" value="587"/></div>
-            <div class="fg"><label>Sender Email</label><input type="email" id="smtp-user" placeholder="your_email@gmail.com"/></div>
-            <div class="fg"><label>App Password</label><input type="password" id="smtp-pass" placeholder="••••••••••••••••"/></div>
-          </div>
-          <div style="text-align:right;margin-top:12px">
-            <button class="btn btn-o" onclick="saveSmtp()">💾 Save SMTP Settings</button>
-          </div>
-        </div>
-
-        <div class="div"></div>
-
-        <div class="run-row">
-          <div class="run-hint" id="run-hint"></div>
-          <button class="btn btn-p btn-lg" id="run-btn" onclick="startJob()">▶&nbsp; Start Download</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- DOWNLOAD CARD -->
-    <div class="dl-card" id="dl-card">
-      <div class="dl-inner">
-        <div class="dl-icon">📦</div>
-        <div>
-          <div class="dl-title">Your PDFs are ready!</div>
-          <div class="dl-sub"><span id="dl-count">0</span> COI PDFs packaged into a single ZIP</div>
-          <div class="dl-note">⚡ Download now — file clears on server restart</div>
-        </div>
-        <div class="dl-actions">
-          <button class="btn btn-g btn-lg" onclick="downloadPDFs()">📥 Download ZIP</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- PROGRESS -->
-    <div class="card prog" id="prog">
-      <div class="ch">
-        <div class="ch-ico">📊</div>
-        <div>
-          <div class="ch-h">Progress</div>
-          <div class="ch-s" id="prog-sub">Initialising...</div>
-        </div>
-      </div>
-      <div class="cb">
-        <div class="sg">
-          <div class="sb-box"><div class="sv b" id="s-tot">0</div><div class="sl">Total</div></div>
-          <div class="sb-box"><div class="sv"   id="s-pro">0</div><div class="sl">Processed</div></div>
-          <div class="sb-box"><div class="sv g" id="s-ok" >0</div><div class="sl">✅ Success</div></div>
-          <div class="sb-box"><div class="sv r" id="s-err">0</div><div class="sl">❌ Failed</div></div>
-        </div>
-        <div class="pbw"><div class="pbf" id="pb"></div></div>
-        <div class="log" id="log"><div class="log-ph">⏳ Waiting for job to start...</div></div>
-      </div>
-    </div>
-
-  </div>
-</main>
-
-<div id="toast"></div>
-
-<script>
-function navTo(n,el){if(el.classList.contains('disabled'))return;document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.ni').forEach(x=>x.classList.remove('active'));document.getElementById('page-'+n).classList.add('active');el.classList.add('active');}
-
-let _tt;
-function toast(msg,type=''){const t=document.getElementById('toast');t.textContent=msg;t.className='show '+type;clearTimeout(_tt);_tt=setTimeout(()=>t.classList.remove('show'),3500);}
-
-let _file=null;
-const zone=document.getElementById('upload-zone');
-zone.addEventListener('click',()=>document.getElementById('excel-input').click());
-zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('drag');});
-zone.addEventListener('dragleave',e=>{if(!zone.contains(e.relatedTarget))zone.classList.remove('drag');});
-zone.addEventListener('drop',e=>{e.preventDefault();zone.classList.remove('drag');const f=e.dataTransfer.files[0];if(f)trySetFile(f);});
-function fileChosen(inp){if(inp.files[0])trySetFile(inp.files[0]);}
-function trySetFile(f){if(!f.name.match(/\.(xlsx|xls)$/i)){toast('Please select an .xlsx or .xls file','error');return;}_file=f;zone.style.display='none';const c=document.getElementById('file-chip');c.style.display='flex';document.getElementById('fc-name').textContent=f.name;document.getElementById('fc-size').textContent=f.size>1048576?(f.size/1048576).toFixed(1)+' MB':Math.round(f.size/1024)+' KB';}
-function clearFile(){_file=null;document.getElementById('file-chip').style.display='none';zone.style.display='';document.getElementById('excel-input').value='';}
-
-function toggleSmtp(cb){document.getElementById('smtp-wrap').classList.toggle('open',cb.checked);}
-async function saveSmtp(){try{await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({smtp_host:document.getElementById('smtp-host').value,smtp_port:parseInt(document.getElementById('smtp-port').value)||587,smtp_user:document.getElementById('smtp-user').value,smtp_password:document.getElementById('smtp-pass').value})});toast('SMTP settings saved ✓','ok');}catch{toast('Save failed','error');}}
-
-let _tot=0,_ok=0,_err=0,_pro=0,_poll=null;
-function setRunning(on){const b=document.getElementById('run-btn');b.disabled=on;b.innerHTML=on?'⏳&nbsp; Running...':'▶&nbsp; Start Download';document.getElementById('spill').classList.toggle('running',on);document.getElementById('sdot').classList.toggle('pulse',on);document.getElementById('stxt').textContent=on?'Running':'Idle';}
-function updStats(tot,pro,ok,err){if(tot!==undefined){_tot=tot;document.getElementById('s-tot').textContent=tot;}if(pro!==undefined){_pro=pro;document.getElementById('s-pro').textContent=pro;}if(ok!==undefined){_ok=ok;document.getElementById('s-ok').textContent=ok;}if(err!==undefined){_err=err;document.getElementById('s-err').textContent=err;}document.getElementById('pb').style.width=(_tot>0?Math.round(_pro/_tot*100):0)+'%';}
-
-const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-const ts=()=>new Date().toTimeString().slice(0,8);
-function addLog(type,msg){const el=document.getElementById('log');el.querySelector('.log-ph')?.remove();const d=document.createElement('div');d.className='ll '+type;d.innerHTML=`<span class="lt">${ts()}</span><span class="lm">${esc(msg)}</span>`;el.appendChild(d);el.scrollTop=el.scrollHeight;}
-function hint(msg,dur=4000){const h=document.getElementById('run-hint');h.textContent=msg;setTimeout(()=>{if(h.textContent===msg)h.textContent='';},dur);}
-
-function pollForDownload(cnt){document.getElementById('prog-sub').textContent='Packaging your PDFs...';clearInterval(_poll);let tries=0;_poll=setInterval(async()=>{if(++tries>45){clearInterval(_poll);return;}try{const d=await(await fetch('/api/coi/status')).json();if(d.downloadReady){clearInterval(_poll);document.getElementById('prog-sub').textContent='Complete';document.getElementById('dl-count').textContent=cnt;const c=document.getElementById('dl-card');c.classList.add('open');c.scrollIntoView({behavior:'smooth',block:'center'});toast('📥 Your PDFs are ready!','ok');}}catch{}},1000);}
-function downloadPDFs(){window.location.href='/api/coi/download';}
-
-async function startJob(){
-  if(!_file){hint('⚠️ Upload an Excel file first');return;}
-  const email=document.getElementById('email-tog').checked;
-  if(email&&!document.getElementById('smtp-user').value.trim()){hint('⚠️ SMTP email required');return;}
-  if(email&&!document.getElementById('smtp-pass').value.trim()){hint('⚠️ SMTP password required');return;}
-  const mapping={};let mapOk=true;
-  document.querySelectorAll('.map-input').forEach(inp=>{
-    inp.classList.remove('err');
-    const val=inp.value.trim();
-    if(val)mapping[inp.dataset.field]=val;
-    if(inp.dataset.req==='1'&&!val){inp.classList.add('err');mapOk=false;}
-  });
-  if(!mapOk){hint('⚠️ Fill in Excel headers for all 5 mandatory fields (highlighted in red)',6000);document.querySelector('.map-input.err')?.scrollIntoView({behavior:'smooth',block:'center'});return;}
-  _tot=_ok=_err=_pro=0;updStats(0,0,0,0);
-  document.getElementById('log').innerHTML='<div class="log-ph">⏳ Waiting for job to start...</div>';
-  document.getElementById('prog').classList.add('open');
-  document.getElementById('dl-card').classList.remove('open');
-  document.getElementById('prog-sub').textContent='Preparing...';
-  document.getElementById('pb').style.width='0';
-  setRunning(true);
-  const fd=new FormData();
-  fd.append('excel',_file);fd.append('send_email',email);
-  fd.append('smtp_host',document.getElementById('smtp-host').value);
-  fd.append('smtp_port',document.getElementById('smtp-port').value);
-  if(email){fd.append('smtp_user',document.getElementById('smtp-user').value);fd.append('smtp_password',document.getElementById('smtp-pass').value);}
-  fd.append('column_mapping',JSON.stringify(mapping));
-  fd.append('batch_name',document.getElementById('batch-name').value.trim()||'COI_Downloads');
-  let resp;
-  try{resp=await fetch('/api/coi/start',{method:'POST',body:fd});}catch(e){toast('Cannot reach server: '+e.message,'error');setRunning(false);return;}
-  const data=await resp.json();
-  if(data.status!=='started'){toast('❌ '+(data.message||'Failed to start'),'error');setRunning(false);return;}
-  const es=new EventSource('/api/coi/stream');
-  es.onmessage=ev=>{
-    const msg=JSON.parse(ev.data);
-    switch(msg.type){
-      case 'info': addLog('info',msg.message);if(msg.total)updStats(msg.total,0,0,0);document.getElementById('prog-sub').textContent=`0 / ${msg.total??'?'} records`;break;
-      case 'processing': addLog('processing','── '+msg.message);updStats(msg.total,msg.current,_ok,_err);document.getElementById('prog-sub').textContent=`${msg.current} / ${msg.total} records`;break;
-      case 'step':    addLog('step',msg.message);break;
-      case 'success': addLog('success','✅ '+msg.message);updStats(undefined,undefined,_ok+1,undefined);break;
-      case 'error':   addLog('error','❌ '+msg.message);updStats(undefined,undefined,undefined,_err+1);break;
-      case 'skip':    addLog('skip','⚠️ '+msg.message);updStats(undefined,undefined,undefined,_err+1);break;
-      case 'email':   addLog('email','📧 '+msg.message);break;
-      case 'done':
-        addLog('done','🎉 '+msg.message);
-        if(msg.total!==undefined)updStats(msg.total,msg.total,msg.success,msg.failed);
-        document.getElementById('pb').style.width='100%';
-        setRunning(false);es.close();
-        if(msg.success>0)pollForDownload(msg.success);
-        else{document.getElementById('prog-sub').textContent='Completed';toast('No PDFs were downloaded','warn');}
-        break;
-    }
-  };
-  es.onerror=()=>{addLog('error','Connection lost.');setRunning(false);es.close();};
+# ─────────────────────────────────────────────
+#  Product → Trigger Name Map
+# ─────────────────────────────────────────────
+TRIGGER_MAP = {
+    "GLP"      : "IFL_OnDemand_GLP",
+    "HEALTH"   : "IFL_OnDemand_Hospicare",
+    "MICRO"    : "IFL_OnDemand_Micro",
+    "GTL"      : "IFL_OnDemand_GTL",
+    "GCL"      : "IFL_OnDemand_GroupCreditLife",
+    "GCL PLUS" : "IFL_OnDemand_GCLPlus",
 }
 
-(async()=>{
-  try{const c=await(await fetch('/api/config')).json();if(c.smtp_host)document.getElementById('smtp-host').value=c.smtp_host;if(c.smtp_port)document.getElementById('smtp-port').value=c.smtp_port;if(c.smtp_user)document.getElementById('smtp-user').value=c.smtp_user;}catch{}
-  try{const s=await(await fetch('/api/coi/status')).json();if(s.downloadReady){document.getElementById('dl-card').classList.add('open');document.getElementById('dl-count').textContent='?';document.getElementById('prog').classList.add('open');addLog('info','Previous job results available for download.');}}catch{}
-})();
-</script>
-</body>
-</html>
+
+# ─────────────────────────────────────────────
+#  Request Headers
+# ─────────────────────────────────────────────
+HEADERS_BASE = {
+    "User-Agent" : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept"     : "application/json, text/plain, */*",
+    "Origin"     : "https://www.indiafirstlife.com",
+    "Referer"    : "https://www.indiafirstlife.com/common-coi",
+}
+
+
+# ─────────────────────────────────────────────
+#  Encryption Helpers
+# ─────────────────────────────────────────────
+def simple_aes_encrypt(plaintext: str) -> str:
+    cipher = AES.new(SIMPLE_KEY, AES.MODE_CBC, SIMPLE_IV)
+    ct = cipher.encrypt(pad(plaintext.encode("utf-8"), AES.block_size))
+    return base64.b64encode(ct).decode("utf-8")
+
+
+def simple_aes_decrypt(ciphertext_b64: str) -> str:
+    ct = base64.b64decode(ciphertext_b64)
+    cipher = AES.new(SIMPLE_KEY, AES.MODE_CBC, SIMPLE_IV)
+    return unpad(cipher.decrypt(ct), AES.block_size).decode("utf-8")
+
+
+def _pbkdf2_sha1(password: bytes, salt: bytes, iterations: int, key_len: int) -> bytes:
+    return hashlib.pbkdf2_hmac("sha1", password, salt, iterations, dklen=key_len)
+
+
+def pbkdf2_aes_encrypt(passphrase: str, plaintext: str) -> str:
+    salt   = os.urandom(32)
+    iv     = os.urandom(16)
+    key    = _pbkdf2_sha1(passphrase.encode("utf-8"), salt, PBKDF2_ITERS, PBKDF2_KEY_LEN)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    ct     = cipher.encrypt(pad(plaintext.encode("utf-8"), AES.block_size))
+    return salt.hex() + iv.hex() + base64.b64encode(ct).decode("utf-8")
+
+
+def pbkdf2_aes_decrypt(passphrase: str, ciphertext: str) -> str:
+    salt   = bytes.fromhex(ciphertext[:64])
+    iv     = bytes.fromhex(ciphertext[64:96])
+    ct     = base64.b64decode(ciphertext[96:])
+    key    = _pbkdf2_sha1(passphrase.encode("utf-8"), salt, PBKDF2_ITERS, PBKDF2_KEY_LEN)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    return unpad(cipher.decrypt(ct), AES.block_size).decode("utf-8")
+
+
+# ─────────────────────────────────────────────
+#  Token Helper
+# ─────────────────────────────────────────────
+def get_bearer_token(session: requests.Session, token_body: str) -> str:
+    resp = session.post(
+        TOKEN_URL,
+        data=token_body,
+        headers={**HEADERS_BASE, "Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+# ─────────────────────────────────────────────
+#  Step 1 — Fetch Policy Details
+# ─────────────────────────────────────────────
+def get_policy_details(session, token, product_type, number_type, number_value, master_policy=""):
+    payload = {
+        "Product_Type"        : product_type,
+        "Master_Policy_Number": master_policy,
+        "Filter_Type"         : number_type,
+        "Filter_Value"        : number_value,
+    }
+    encrypted = simple_aes_encrypt(json.dumps(payload))
+    resp = session.post(
+        STEP1_URL,
+        json={"data": encrypted},
+        headers={**HEADERS_BASE, "Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    resp_json = resp.json()
+    if "data" not in resp_json:
+        raise ValueError(f"Unexpected Step 1 response: {resp_json}")
+    decrypted = json.loads(simple_aes_decrypt(resp_json["data"]))
+    if isinstance(decrypted, dict) and "getGroupCoiResponse" in decrypted:
+        records = decrypted["getGroupCoiResponse"].get("data", [])
+        if not records:
+            raise ValueError(f"No policy records found for {number_value}")
+        return records[0]
+    return decrypted
+
+
+# ─────────────────────────────────────────────
+#  Step 2 — Download COI PDF
+# ─────────────────────────────────────────────
+def download_coi_pdf(session, token, trigger_name, rec, dob, financial_year, number_type, number_value):
+    dob_normalised = dob.replace("-", "/")
+
+    webhook_payload = {
+        "triggerName"        : trigger_name,
+        "to"                 : [], "cc": [], "bcc": [],
+        "mobileNumber"       : rec.get("mobileNo", ""),
+        "communicationCode"  : "0",
+        "attachementRequired": "yes",
+        "isPdfRequired"      : True,
+        "data": {
+            "HeaderName"             : "",
+            "UIN"                    : rec.get("UIN", ""),
+            "MobileNo"               : rec.get("mobileNo", ""),
+            "MasterPolicyholderName" : rec.get("masterPolicyHolderName", ""),
+            "MasterPolicyNo"         : rec.get("masterPolicyNumber", ""),
+            "BaseSumAssured"         : rec.get("baseSumAssured", ""),
+            "premiumPaid"            : rec.get("dprem01", ""),
+            "PremiumPayingFrequency" : rec.get("premiumPayingFrequency", ""),
+            "COINumber"              : rec.get("coiNo", ""),
+            "MemberNumber"           : rec.get("memberNumber", ""),
+            "MemberAge"              : rec.get("memberAge", ""),
+            "JointMemberName"        : rec.get("jointMember", ""),
+            "jointborrowerDOB"       : rec.get("jointMemberDOB", ""),
+            "RelationshipOfNominee"  : rec.get("relationshipOfNominee", ""),
+            "JointLifeSumAssured"    : rec.get("jointLifeSumAssured", ""),
+            "typeOfCover"            : rec.get("typeOfCover", ""),
+            "loanNo"                 : rec.get("loanNo", ""),
+            "borrowerName"           : rec.get("borrowerName", ""),
+            "borrowerDOB"            : rec.get("borrowerDOB", ""),
+            "borrowerGender"         : rec.get("borrowerGender", ""),
+            "SumAssured"             : rec.get("sumassured", ""),
+            "totalsumassured"        : rec.get("totalsumassured", ""),
+            "PLANNO"                 : rec.get("benefitOption", ""),
+            "PAYMTH"                 : rec.get("paymth", ""),
+            "coverTerm"              : rec.get("coverTerm", ""),
+            "premiumPaymentTerm"     : rec.get("premiumPaymentTerm", ""),
+            "Pay_Frequency"          : rec.get("premiumPayingFrequency", ""),
+            "coverCommencementDate"  : rec.get("coverCommencementDate", ""),
+            "coverEndDate"           : rec.get("coverEndDate", ""),
+            "DOB"                    : dob_normalised,
+            "Financial_Year"         : financial_year,
+            "Filter_Type"            : number_type,
+            "Filter_Value"           : number_value,
+            "Product_Type"           : trigger_name.split("_")[-1] if "_" in trigger_name else "",
+        },
+    }
+
+    encrypted = pbkdf2_aes_encrypt(CODE_KEY, json.dumps(webhook_payload))
+    resp = session.post(
+        STEP2_URL,
+        json={"data": encrypted},
+        headers={**HEADERS_BASE, "Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    resp_json = resp.json()
+
+    if resp_json.get("header", {}).get("statusCode") != "200":
+        raise ValueError(f"API error: {resp_json.get('header', {}).get('responseMessage')}")
+
+    decrypted = pbkdf2_aes_decrypt(CODE_KEY, resp_json["response"])
+    resp_data = json.loads(decrypted)
+
+    if resp_data.get("status") != "200":
+        raise ValueError(f"PDF fetch failed: {resp_data}")
+
+    return base64.b64decode(resp_data["fileContent"])
+
+
+# ─────────────────────────────────────────────
+#  Email Helper
+# ─────────────────────────────────────────────
+def send_email_with_pdf(smtp_cfg: dict, to_email: str, customer_name: str,
+                        pdf_bytes: bytes, pdf_filename: str):
+    msg            = MIMEMultipart()
+    msg["From"]    = smtp_cfg["user"]
+    msg["To"]      = to_email
+    msg["Subject"] = "Your Certificate of Insurance (COI) — IndiaFirst Life"
+    greeting = f"Dear {customer_name}," if customer_name else "Dear Customer,"
+    body = (
+        f"{greeting}\n\n"
+        "Please find your Certificate of Insurance (COI) attached to this email.\n\n"
+        "If you have any queries, please contact IndiaFirst Life customer care.\n\n"
+        "Regards,\nIndiaFirst Life Team"
+    )
+    msg.attach(MIMEText(body, "plain"))
+    part = MIMEBase("application", "pdf")
+    part.set_payload(pdf_bytes)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f'attachment; filename="{pdf_filename}"')
+    msg.attach(part)
+    with smtplib.SMTP(smtp_cfg["host"], smtp_cfg["port"]) as srv:
+        srv.starttls()
+        srv.login(smtp_cfg["user"], smtp_cfg["password"])
+        srv.send_message(msg)
+
+
+# ─────────────────────────────────────────────
+#  Main Processor
+# ─────────────────────────────────────────────
+def process_customers(excel_bytes: bytes, output_dir: str,
+                      smtp_cfg: dict, send_email: bool,
+                      log_cb, column_mapping: dict = None):
+    """
+    Process every row in the Excel and download COI PDFs.
+
+    Parameters
+    ----------
+    excel_bytes    : bytes     Excel file as raw bytes (uploaded via browser).
+    output_dir     : str       Temp folder where PDFs are saved before zipping.
+    smtp_cfg       : dict      Keys: host, port, user, password
+    send_email     : bool      Whether to email each PDF to the customer.
+    log_cb         : callable  Receives a dict event streamed live to the browser.
+                               Event keys: type, message, [total, current, success, failed]
+    column_mapping : dict      Maps required field name → user's actual Excel column header.
+                               e.g. {"product_name": "Product Type", "dob": "Date of Birth"}
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # ── Read Excel ──
+    df = pd.read_excel(io.BytesIO(excel_bytes))
+
+    # ── Apply column header mapping ──
+    # Renames user's Excel columns to the internal required field names
+    if column_mapping:
+        rename = {v.strip(): k for k, v in column_mapping.items() if v and v.strip()}
+        df.rename(columns=rename, inplace=True)
+
+    # Normalise remaining column names (strip spaces, lowercase, underscores)
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+    # ── Validate mandatory columns ──
+    mandatory = {"product_name", "financial_year", "dob", "number_type", "number_value"}
+    missing   = mandatory - set(df.columns)
+    if missing:
+        log_cb({"type": "error",
+                "message": f"Missing mandatory columns after mapping: {missing}. "
+                           f"Check your Excel header mapping."})
+        log_cb({"type": "done", "message": "Job aborted.", "success": 0, "failed": 0, "total": 0})
+        return
+
+    # ── Ensure optional columns exist ──
+    for col in ["customer_name", "email", "master_policy"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    total   = len(df)
+    success = failed = 0
+
+    log_cb({"type": "info", "message": f"Loaded {total} records from Excel.", "total": total})
+
+    # ── Process each row ──
+    for idx, row in df.iterrows():
+        customer_name  = str(row["customer_name"]).strip()  if pd.notna(row["customer_name"]) else ""
+        email          = str(row["email"]).strip()          if pd.notna(row["email"])          else ""
+        product_name   = str(row["product_name"]).strip().upper()
+        financial_year = str(row["financial_year"]).strip()
+        dob            = str(row["dob"]).strip()
+        number_type    = str(row["number_type"]).strip().lower()
+        number_value   = str(row["number_value"]).strip()
+        master_policy  = str(row["master_policy"]).strip() if pd.notna(row["master_policy"]) else ""
+
+        log_cb({
+            "type"   : "processing",
+            "message": f"Processing: {number_value}",
+            "current": idx + 1,
+            "total"  : total,
+        })
+
+        # ── Validate product ──
+        trigger_name = TRIGGER_MAP.get(product_name)
+        if not trigger_name:
+            log_cb({"type": "skip",
+                    "message": f"[{number_value}] Unknown product '{product_name}'. "
+                               f"Valid values: {list(TRIGGER_MAP)}"})
+            failed += 1
+            continue
+
+        pdf_filename  = f"{number_value}_COI.pdf"
+        pdf_save_path = output_path / pdf_filename
+
+        try:
+            session = requests.Session()
+
+            # Step 1 — fetch token + policy details
+            log_cb({"type": "step", "message": f"[{number_value}] → Step 1: fetching token..."})
+            token1 = get_bearer_token(session, TOKEN_BODY_STEP1)
+
+            log_cb({"type": "step", "message": f"[{number_value}] → Fetching policy details..."})
+            rec = get_policy_details(
+                session, token1, product_name, number_type, number_value, master_policy
+            )
+
+            # Step 2 — fetch token + download PDF
+            log_cb({"type": "step", "message": f"[{number_value}] → Step 2: fetching token..."})
+            token2 = get_bearer_token(session, TOKEN_BODY_STEP2)
+
+            log_cb({"type": "step", "message": f"[{number_value}] → Downloading COI PDF..."})
+            pdf_bytes = download_coi_pdf(
+                session, token2, trigger_name, rec,
+                dob, financial_year, number_type, number_value
+            )
+
+            # Save PDF to temp folder
+            with open(pdf_save_path, "wb") as f:
+                f.write(pdf_bytes)
+
+            log_cb({"type": "success",
+                    "message": f"[{number_value}] Saved — {len(pdf_bytes):,} bytes → {pdf_filename}"})
+
+            # Email PDF if requested
+            if send_email and email and email.lower() not in ("nan", "none", ""):
+                log_cb({"type": "step", "message": f"[{number_value}] → Emailing to {email}..."})
+                send_email_with_pdf(smtp_cfg, email, customer_name, pdf_bytes, pdf_filename)
+                log_cb({"type": "email", "message": f"[{number_value}] Email sent to {email}"})
+
+            success += 1
+
+        except Exception as exc:
+            log_cb({"type": "error", "message": f"[{number_value}] ERROR: {exc}"})
+            failed += 1
+
+        time.sleep(2)   # polite delay between API calls
+
+    # ── Final summary ──
+    log_cb({
+        "type"   : "done",
+        "message": f"Completed — ✅ {success} success | ❌ {failed} failed | Total: {total}",
+        "success": success,
+        "failed" : failed,
+        "total"  : total,
+    })
