@@ -332,11 +332,12 @@
           <button class="fc-rm" onclick="clearFile()" title="Remove">✕</button>
         </div>
 
-        <div class="div"></div>
+        <div class="fg" style="margin-top:16px">
+          <label>📁 Batch / Folder Name</label>
+          <input type="text" id="batch-name" placeholder="e.g. March_2025 — becomes the ZIP filename on download"/>
+        </div>
 
-        <div class="trow">
-          <div>
-            <div class="tlbl">📧 Send Email to Customers</div>
+        <div class="div"></div>
             <div class="tdesc">Automatically email each COI PDF to the customer's address column</div>
           </div>
           <label class="tgl">
@@ -467,6 +468,7 @@ async function startJob(){
   fd.append('smtp_port',document.getElementById('smtp-port').value);
   if(email){fd.append('smtp_user',document.getElementById('smtp-user').value);fd.append('smtp_password',document.getElementById('smtp-pass').value);}
   fd.append('column_mapping',JSON.stringify(mapping));
+  fd.append('batch_name',document.getElementById('batch-name').value.trim()||'COI_Downloads');
   let resp;
   try{resp=await fetch('/api/coi/start',{method:'POST',body:fd});}catch(e){toast('Cannot reach server: '+e.message,'error');setRunning(false);return;}
   const data=await resp.json();
