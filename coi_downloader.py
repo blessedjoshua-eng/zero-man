@@ -263,4 +263,135 @@ def send_email_with_pdf(smtp_cfg: dict, to_email: str, customer_name: str,
 #  Main Processor
 # ─────────────────────────────────────────────
 def process_customers(excel_bytes: bytes, output_dir: str,
-                      smtp_cfg: dict, send_email:
+                      smtp_cfg: dict, send_email: bool,
+                      log_cb, column_mapping: dict = None):
+    """
+    Process every row in the Excel and download COI PDFs.
+
+    Parameters
+    ----------
+    excel_bytes    : bytes     Excel file as raw bytes (uploaded via browser).
+    output_dir     : str       Temp folder where PDFs are saved before zipping.
+    smtp_cfg       : dict      Keys: host, port, user, password
+    send_email     : bool      Whether to email each PDF to the customer.
+    log_cb         : callable  Receives a dict event streamed live to the browser.
+                               Event keys: type, message, [total, current, success, failed]
+    column_mapping : dict      Maps required field name → user's actual Excel column header.
+                               e.g. {"product_name": "Product Type", "dob": "Date of Birth"}
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # ── Read Excel ──
+    df = pd.read_excel(io.BytesIO(excel_bytes))
+
+    # ── Apply column header mapping ──
+    # Renames user's Excel columns to the internal required field names
+    if column_mapping:
+        rename = {v.strip(): k for k, v in column_mapping.items() if v and v.strip()}
+        df.rename(columns=rename, inplace=True)
+
+    # Normalise remaining column names (strip spaces, lowercase, underscores)
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+    # ── Validate mandatory columns ──
+    mandatory = {"product_name", "financial_year", "dob", "number_type", "number_value"}
+    missing   = mandatory - set(df.columns)
+    if missing:
+        log_cb({"type": "error",
+                "message": f"Missing mandatory columns after mapping: {missing}. "
+                           f"Check your Excel header mapping."})
+        log_cb({"type": "done", "message": "Job aborted.", "success": 0, "failed": 0, "total": 0})
+        return
+
+    # ── Ensure optional columns exist ──
+    for col in ["customer_name", "email", "master_policy"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    total   = len(df)
+    success = failed = 0
+
+    log_cb({"type": "info", "message": f"Loaded {total} records from Excel.", "total": total})
+
+    # ── Process each row ──
+    for idx, row in df.iterrows():
+        customer_name  = str(row["customer_name"]).strip()  if pd.notna(row["customer_name"]) else ""
+        email          = str(row["email"]).strip()          if pd.notna(row["email"])          else ""
+        product_name   = str(row["product_name"]).strip().upper()
+        financial_year = str(row["financial_year"]).strip()
+        dob            = str(row["dob"]).strip()
+        number_type    = str(row["number_type"]).strip().lower()
+        number_value   = str(row["number_value"]).strip()
+        master_policy  = str(row["master_policy"]).strip() if pd.notna(row["master_policy"]) else ""
+
+        log_cb({
+            "type"   : "processing",
+            "message": f"Processing: {number_value}",
+            "current": idx + 1,
+            "total"  : total,
+        })
+
+        # ── Validate product ──
+        trigger_name = TRIGGER_MAP.get(product_name)
+        if not trigger_name:
+            log_cb({"type": "skip",
+                    "message": f"[{number_value}] Unknown product '{product_name}'. "
+                               f"Valid values: {list(TRIGGER_MAP)}"})
+            failed += 1
+            continue
+
+        pdf_filename  = f"{number_value}_COI.pdf"
+        pdf_save_path = output_path / pdf_filename
+
+        try:
+            session = requests.Session()
+
+            # Step 1 — fetch token + policy details
+            log_cb({"type": "step", "message": f"[{number_value}] → Step 1: fetching token..."})
+            token1 = get_bearer_token(session, TOKEN_BODY_STEP1)
+
+            log_cb({"type": "step", "message": f"[{number_value}] → Fetching policy details..."})
+            rec = get_policy_details(
+                session, token1, product_name, number_type, number_value, master_policy
+            )
+
+            # Step 2 — fetch token + download PDF
+            log_cb({"type": "step", "message": f"[{number_value}] → Step 2: fetching token..."})
+            token2 = get_bearer_token(session, TOKEN_BODY_STEP2)
+
+            log_cb({"type": "step", "message": f"[{number_value}] → Downloading COI PDF..."})
+            pdf_bytes = download_coi_pdf(
+                session, token2, trigger_name, rec,
+                dob, financial_year, number_type, number_value
+            )
+
+            # Save PDF to temp folder
+            with open(pdf_save_path, "wb") as f:
+                f.write(pdf_bytes)
+
+            log_cb({"type": "success",
+                    "message": f"[{number_value}] Saved — {len(pdf_bytes):,} bytes → {pdf_filename}"})
+
+            # Email PDF if requested
+            if send_email and email and email.lower() not in ("nan", "none", ""):
+                log_cb({"type": "step", "message": f"[{number_value}] → Emailing to {email}..."})
+                send_email_with_pdf(smtp_cfg, email, customer_name, pdf_bytes, pdf_filename)
+                log_cb({"type": "email", "message": f"[{number_value}] Email sent to {email}"})
+
+            success += 1
+
+        except Exception as exc:
+            log_cb({"type": "error", "message": f"[{number_value}] ERROR: {exc}"})
+            failed += 1
+
+        time.sleep(2)   # polite delay between API calls
+
+    # ── Final summary ──
+    log_cb({
+        "type"   : "done",
+        "message": f"Completed — ✅ {success} success | ❌ {failed} failed | Total: {total}",
+        "success": success,
+        "failed" : failed,
+        "total"  : total,
+    })
