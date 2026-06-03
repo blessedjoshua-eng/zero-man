@@ -489,6 +489,14 @@ async function startJob(){
         if(msg.total!==undefined)updStats(msg.total,msg.total,msg.success,msg.failed);
         document.getElementById('pb').style.width='100%';
         setRunning(false);es.close();
+        // Auto-download log Excel after a short delay
+        setTimeout(()=>{
+          const a=document.createElement('a');
+          a.href='/api/coi/download-log';
+          a.download='COI_Job_Log.xlsx';
+          document.body.appendChild(a);a.click();document.body.removeChild(a);
+          toast('📊 Job log downloaded automatically','ok');
+        },800);
         if(msg.success>0)pollForDownload(msg.success);
         else{document.getElementById('prog-sub').textContent='Completed';toast('No PDFs were downloaded','warn');}
         break;
